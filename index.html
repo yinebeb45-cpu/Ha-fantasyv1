@@ -128,83 +128,55 @@ const UF_TELEGRAM_AUTH_URL="https://xbsgwcjvjlqvbglkdwrz.supabase.co/functions/v
 const UF_SUPABASE_READY = SUPABASE_URL.startsWith("https://") && !SUPABASE_URL.includes("PASTE_") && !SUPABASE_PUBLISHABLE_KEY.includes("PASTE_");
 const ufSupabase = UF_SUPABASE_READY ? window.supabase.createClient(SUPABASE_URL,SUPABASE_PUBLISHABLE_KEY) : null;
 async function syncTelegramUser(){
-  if(!ufSupabase){console.warn("Supabase user sync skipped: client is not ready.");return null;}
-  const tgUser=user();
-  const isRealTelegramUser=!!(window.Telegram&&Telegram.WebApp&&Telegram.WebApp.initDataUnsafe&&Telegram.WebApp.initDataUnsafe.user&&Telegram.WebApp.initDataUnsafe.user.id);
-  if(!isRealTelegramUser){
-    console.warn("U-Fantasy: no real Telegram WebApp user detected. User sync skipped outside Telegram.");
+  // User create/update MUST go through the Edge Function (service role).
+  // Direct client insert/update on public.users is blocked by RLS.
+  if(!UF_SUPABASE_READY){
+    console.warn("Supabase user sync skipped: client is not ready.");
     return null;
   }
-  const telegramId=String(tgUser.id);
+  const tg=window.Telegram&&Telegram.WebApp;
+  if(!tg||!tg.initData){
+    console.warn("U-Fantasy: no real Telegram WebApp initData. User sync skipped outside Telegram.");
+    return null;
+  }
   try{
-    const {data:existing,error:findError}=await ufSupabase
-      .from("users")
-      .select("id,telegram_id,username,nickname,avatar_url")
-      .eq("telegram_id",telegramId)
-      .maybeSingle();
-    if(findError)throw findError;
-
-    const payload={
-      telegram_id:telegramId,
-      username:tgUser.username||null,
-      avatar_url:tgUser.photo_url||null
-    };
-
-    // Preserve an existing nickname. Only use the Telegram first name for a brand-new account.
-    if(existing){
-      if(existing.nickname){
-        state.nickname=existing.nickname;
-      }else{
-        const starter=(tgUser.first_name||"Player").trim().slice(0,18)||"Player";
-        payload.nickname=starter;
-      }
-      const {data,error}=await ufSupabase.from("users").update(payload).eq("id",existing.id)
-        .select("id,telegram_id,username,nickname,avatar_url").single();
-      if(error)throw error;
-      state.currentUserId=data.id;
-      state.userSynced=true;
-      await ensureWalletRow(data.id);
-      if(data.nickname)localStorage.setItem("uf_nickname",data.nickname);
-      renderProfile();
-      renderHome();
-      const ws=document.getElementById("walletConnectionStatus");if(ws)ws.textContent="✅ Telegram account connected";
-      console.log("U-Fantasy existing user loaded:",data);
-      return data;
+    const res=await fetch(UF_TELEGRAM_AUTH_URL,{
+      method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({initData:tg.initData})
+    });
+    const body=await res.json().catch(()=>({}));
+    if(!res.ok||!body.ok){
+      throw new Error(body.error||("Auth failed ("+res.status+")"));
     }
-
-    payload.nickname=state.nickname||tgUser.first_name||"Player";
-    const {data,error}=await ufSupabase.from("users").insert(payload)
-      .select("id,telegram_id,username,nickname,avatar_url").single();
-    if(error)throw error;
+    const data=body.user;
+    if(!data||!data.id)throw new Error("Edge function returned no user");
     state.currentUserId=data.id;
     state.userSynced=true;
-    await ensureWalletRow(data.id);
-    if(data.nickname){state.nickname=data.nickname;localStorage.setItem("uf_nickname",data.nickname);}
+    if(data.nickname){
+      state.nickname=data.nickname;
+      localStorage.setItem("uf_nickname",data.nickname);
+    }
+    // Wallet row is created by the edge function; no client upsert needed.
     renderProfile();
     renderHome();
-    const ws=document.getElementById("walletConnectionStatus");if(ws)ws.textContent="✅ Telegram account connected";
-    console.log("U-Fantasy new user created:",data);
+    const ws=document.getElementById("walletConnectionStatus");
+    if(ws)ws.textContent="✅ Telegram account + Supabase connected";
+    console.log("U-Fantasy user synced via edge function:",data);
     return data;
   }catch(e){
     console.error("U-Fantasy user sync failed:",e);
     toast("Could not sync your Telegram profile");
+    const ws=document.getElementById("walletConnectionStatus");
+    if(ws)ws.textContent="⚠️ Telegram sync failed — open inside Telegram and check edge function";
     return null;
   }
 }
 
 async function ensureWalletRow(userId){
-  if(!ufSupabase||!userId)return false;
-  try{
-    const {error}=await ufSupabase.from("wallets").upsert(
-      {user_id:userId,balance:0},
-      {onConflict:"user_id",ignoreDuplicates:true}
-    );
-    if(error)throw error;
-    return true;
-  }catch(e){
-    console.warn("Wallet row is not ready yet. Run the wallet SQL setup first.",e);
-    return false;
-  }
+  // Wallet is created server-side by the rapid-service edge function.
+  // Client must not upsert wallets (RLS blocks it).
+  return !!(userId);
 }
 
 async function testSupabaseConnection(){
